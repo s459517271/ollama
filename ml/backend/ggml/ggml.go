@@ -312,6 +312,7 @@ func New(ctx context.Context, r *os.File, params ml.BackendParams) (ml.Backend, 
 	g, ctx := errgroup.WithContext(ctx)
 	g.SetLimit(runtime.GOMAXPROCS(0))
 	for _, t := range meta.Tensors().Items() {
+		t := t
 		g.Go(func() error {
 			tts := make([]*C.struct_ggml_tensor, max(1, len(targets[t.Name])))
 			for i := range tts {
@@ -341,6 +342,11 @@ func New(ctx context.Context, r *os.File, params ml.BackendParams) (ml.Backend, 
 
 			var s uint64
 			for s < t.Size() {
+				// Stop if either the parent context has been canceled or if any of the other tensors returned an error
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+
 				n, err := io.ReadFull(sr, bts[:min(len(bts), int(t.Size()-s))])
 				if err != nil {
 					slog.Warn("file read error", "file", r.Name(), "error", err)
@@ -362,14 +368,6 @@ func New(ctx context.Context, r *os.File, params ml.BackendParams) (ml.Backend, 
 			return nil
 		})
 	}
-
-	// start a goroutine to cancel the errgroup if the parent context is done
-	go func() {
-		<-ctx.Done()
-		g.Go(func() error {
-			return ctx.Err()
-		})
-	}()
 
 	if err := g.Wait(); err != nil {
 		return nil, err
@@ -696,6 +694,32 @@ func (c *Context) FromIntSlice(s []int32, shape ...int) (ml.Tensor, error) {
 	return t, nil
 }
 
+func (c Context) Arange(start, stop, step float32, dtype ml.DType) ml.Tensor {
+	switch dtype {
+	case ml.DTypeF32:
+		// ggml_arange creates a float32 tensor
+		return &Tensor{
+			b: c.b,
+			t: C.ggml_arange(c.ctx, C.float(start), C.float(stop), C.float(step)),
+		}
+	case ml.DTypeI32:
+		// ggml_cast does not support float32 to int32 conversion
+		arange := make([]int32, 0, int((stop-start)/step))
+		for i := start; i < stop; i += step {
+			arange = append(arange, int32(i))
+		}
+
+		t, err := c.Input().FromIntSlice(arange, len(arange))
+		if err != nil {
+			panic(err)
+		}
+
+		return t
+	default:
+		panic("unsupported dtype for arange")
+	}
+}
+
 func (c *Context) Close() {
 	if c != nil {
 		for _, b := range *c.allocatedBuffers {
@@ -858,17 +882,32 @@ func (t *Tensor) MulmatFullPrec(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
 	}
 }
 
+func (t *Tensor) MulmatID(ctx ml.Context, t2, ids ml.Tensor) ml.Tensor {
+	return &Tensor{
+		b: t.b,
+		t: C.ggml_mul_mat_id(ctx.(*Context).ctx, t.t, t2.(*Tensor).t, ids.(*Tensor).t),
+	}
+}
+
 func (t *Tensor) LayerNorm(ctx ml.Context, w, b ml.Tensor, eps float32) ml.Tensor {
-	tt := (&Tensor{b: t.b, t: C.ggml_norm(ctx.(*Context).ctx, t.t, C.float(eps))}).Mul(ctx, w)
-	if b != nil {
-		tt = tt.Add(ctx, b)
+	tt := C.ggml_norm(ctx.(*Context).ctx, t.t, C.float(eps))
+	if w != nil {
+		tt = C.ggml_mul(ctx.(*Context).ctx, tt, w.(*Tensor).t)
+		if b != nil {
+			tt = C.ggml_add(ctx.(*Context).ctx, tt, b.(*Tensor).t)
+		}
 	}
 
-	return tt
+	return &Tensor{b: t.b, t: tt}
 }
 
 func (t *Tensor) RMSNorm(ctx ml.Context, w ml.Tensor, eps float32) ml.Tensor {
-	return (&Tensor{b: t.b, t: C.ggml_rms_norm(ctx.(*Context).ctx, t.t, C.float(eps))}).Mul(ctx, w)
+	tt := C.ggml_rms_norm(ctx.(*Context).ctx, t.t, C.float(eps))
+	if w != nil {
+		tt = C.ggml_mul(ctx.(*Context).ctx, tt, w.(*Tensor).t)
+	}
+
+	return &Tensor{b: t.b, t: tt}
 }
 
 func (t *Tensor) Pad(ctx ml.Context, shape ...int) ml.Tensor {
@@ -966,6 +1005,13 @@ func (t *Tensor) Tanh(ctx ml.Context) ml.Tensor {
 	return &Tensor{
 		b: t.b,
 		t: C.ggml_tanh_inplace(ctx.(*Context).ctx, t.t),
+	}
+}
+
+func (t *Tensor) Sigmoid(ctx ml.Context) ml.Tensor {
+	return &Tensor{
+		b: t.b,
+		t: C.ggml_sigmoid_inplace(ctx.(*Context).ctx, t.t),
 	}
 }
 
@@ -1130,5 +1176,12 @@ func (t *Tensor) Duplicate(ctx ml.Context) ml.Tensor {
 	return &Tensor{
 		b: t.b,
 		t: C.ggml_dup(ctx.(*Context).ctx, t.t),
+	}
+}
+
+func (t *Tensor) TopK(ctx ml.Context, k int) ml.Tensor {
+	return &Tensor{
+		b: t.b,
+		t: C.ggml_top_k(ctx.(*Context).ctx, t.t, C.int(k)),
 	}
 }
