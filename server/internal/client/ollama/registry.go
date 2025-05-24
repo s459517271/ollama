@@ -223,8 +223,21 @@ type Registry struct {
 	ChunkingThreshold int64
 
 	// Mask, if set, is the name used to convert non-fully qualified names
-	// to fully qualified names. If empty, [DefaultMask] is used.
+	// to fully qualified names.
+	// If empty, [DefaultMask] is used.
 	Mask string
+
+	// ReadTimeout is the maximum duration for reading the entire request,
+	// including the body.
+	// A zero or negative value means there will be no timeout.
+	ReadTimeout time.Duration
+}
+
+func (r *Registry) readTimeout() time.Duration {
+	if r.ReadTimeout > 0 {
+		return r.ReadTimeout
+	}
+	return 1<<63 - 1 // no timeout, max int
 }
 
 func (r *Registry) cache() (*blob.DiskCache, error) {
@@ -248,8 +261,7 @@ func (r *Registry) parseName(name string) (names.Name, error) {
 
 // DefaultRegistry returns a new Registry configured from the environment. The
 // key is read from $HOME/.ollama/id_ed25519, MaxStreams is set to the
-// value of OLLAMA_REGISTRY_MAXSTREAMS, and ChunkingDirectory is set to the
-// system's temporary directory.
+// value of OLLAMA_REGISTRY_MAXSTREAMS, and ReadTimeout is set to 30 seconds.
 //
 // It returns an error if any configuration in the environment is invalid.
 func DefaultRegistry() (*Registry, error) {
@@ -263,6 +275,7 @@ func DefaultRegistry() (*Registry, error) {
 	}
 
 	var rc Registry
+	rc.ReadTimeout = 30 * time.Second
 	rc.UserAgent = UserAgent()
 	rc.Key, err = ssh.ParseRawPrivateKey(keyPEM)
 	if err != nil {
@@ -431,14 +444,13 @@ func (r *Registry) Push(ctx context.Context, name string, p *PushParams) error {
 //
 // It always calls update with a nil error.
 type trackingReader struct {
-	l      *Layer
 	r      io.Reader
-	update func(n int64)
+	update func(n int64, err error) // err is always nil
 }
 
 func (r *trackingReader) Read(p []byte) (n int, err error) {
 	n, err = r.r.Read(p)
-	r.update(int64(n))
+	r.update(int64(n), nil)
 	return
 }
 
@@ -483,26 +495,40 @@ func (r *Registry) Pull(ctx context.Context, name string) error {
 		expected += l.Size
 	}
 
-	var completed atomic.Int64
 	var g errgroup.Group
 	g.SetLimit(r.maxStreams())
+
+	var completed atomic.Int64
 	for _, l := range layers {
 		var received atomic.Int64
+		update := func(n int64, err error) {
+			if n == 0 && err == nil {
+				// Clients expect an update with no progress and no error to mean "starting download".
+				// This is not the case here,
+				// so we don't want to send an update in this case.
+				return
+			}
+			completed.Add(n)
+			t.update(l, received.Add(n), err)
+		}
 
 		info, err := c.Get(l.Digest)
 		if err == nil && info.Size == l.Size {
-			received.Add(l.Size)
-			completed.Add(l.Size)
-			t.update(l, l.Size, ErrCached)
+			update(l.Size, ErrCached)
 			continue
 		}
 
-		func() {
+		func() (err error) {
+			defer func() {
+				if err != nil {
+					update(0, err)
+				}
+			}()
+
 			var wg sync.WaitGroup
 			chunked, err := c.Chunked(l.Digest, l.Size)
 			if err != nil {
-				t.update(l, received.Load(), err)
-				return
+				return err
 			}
 			defer func() {
 				// Close the chunked writer when all chunks are
@@ -522,11 +548,13 @@ func (r *Registry) Pull(ctx context.Context, name string) error {
 
 			for cs, err := range r.chunksums(ctx, name, l) {
 				if err != nil {
-					// Chunksum stream interrupted. Note in trace
-					// log and let in-flight downloads complete.
-					// This will naturally trigger ErrIncomplete
-					// since received < expected bytes.
-					t.update(l, received.Load(), err)
+					// Note the chunksum stream
+					// interuption, but do not cancel
+					// in-flight downloads. We can still
+					// make progress on them. Once they are
+					// done, ErrIncomplete will be returned
+					// below.
+					update(0, err)
 					break
 				}
 
@@ -540,32 +568,32 @@ func (r *Registry) Pull(ctx context.Context, name string) error {
 				cacheKeyDigest := blob.DigestFromBytes(cacheKey)
 				_, err := c.Get(cacheKeyDigest)
 				if err == nil {
-					recv := received.Add(cs.Chunk.Size())
-					completed.Add(cs.Chunk.Size())
-					t.update(l, recv, ErrCached)
+					update(cs.Chunk.Size(), ErrCached)
 					continue
 				}
 
 				wg.Add(1)
 				g.Go(func() (err error) {
 					defer func() {
-						if err == nil {
-							// Ignore cache key write errors for now. We've already
-							// reported to trace that the chunk is complete.
-							//
-							// Ideally, we should only report completion to trace
-							// after successful cache commit. This current approach
-							// works but could trigger unnecessary redownloads if
-							// the checkpoint key is missing on next pull.
-							//
-							// Not incorrect, just suboptimal - fix this in a
-							// future update.
-							_ = blob.PutBytes(c, cacheKeyDigest, cacheKey)
-						} else {
-							t.update(l, received.Load(), err)
+						defer wg.Done()
+						if err != nil {
+							update(0, err)
 						}
-						wg.Done()
 					}()
+
+					ctx, cancel := context.WithCancelCause(ctx)
+					defer cancel(nil)
+
+					timer := time.AfterFunc(r.readTimeout(), func() {
+						cancel(fmt.Errorf("%w: downloading %s %d-%d/%d",
+							context.DeadlineExceeded,
+							cs.Digest.Short(),
+							cs.Chunk.Start,
+							cs.Chunk.End,
+							l.Size,
+						))
+					})
+					defer timer.Stop()
 
 					req, err := http.NewRequestWithContext(ctx, "GET", cs.URL, nil)
 					if err != nil {
@@ -579,17 +607,22 @@ func (r *Registry) Pull(ctx context.Context, name string) error {
 					defer res.Body.Close()
 
 					tr := &trackingReader{
-						l: l,
 						r: res.Body,
-						update: func(n int64) {
-							completed.Add(n)
-							recv := received.Add(n)
-							t.update(l, recv, nil)
+						update: func(n int64, err error) {
+							timer.Reset(r.readTimeout())
+							update(n, err)
 						},
 					}
-					return chunked.Put(cs.Chunk, cs.Digest, tr)
+					if err := chunked.Put(cs.Chunk, cs.Digest, tr); err != nil {
+						return err
+					}
+
+					// Record the downloading of this chunk.
+					return blob.PutBytes(c, cacheKeyDigest, cacheKey)
 				})
 			}
+
+			return nil
 		}()
 	}
 	if err := g.Wait(); err != nil {
@@ -933,12 +966,6 @@ func (r *Registry) newRequest(ctx context.Context, method, url string, body io.R
 // is parsed from the response body and returned. If any other error occurs, it
 // is returned.
 func sendRequest(c *http.Client, r *http.Request) (_ *http.Response, err error) {
-	defer func() {
-		if err != nil {
-			err = fmt.Errorf("request error %s: %w", r.URL, err)
-		}
-	}()
-
 	if r.URL.Scheme == "https+insecure" {
 		// TODO(bmizerany): clone client.Transport, set
 		// InsecureSkipVerify, etc.
